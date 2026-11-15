@@ -14,7 +14,43 @@ Each sample demonstrates one specific feature of the Conexio Cloud SDK.
 
 </div>
 
+## Installing the Conexio Cloud SDK
+
+Follow the [Conexio Documentation](https://docs.conexiotech.com/), Section: **Getting Started with Conexio Console** on how to install the Conexio Cloud SDK and setup the environment.
+
+## nRF Connect SDK Integration
+
+The SDK integrates with nRF Connect SDK v3.4.1 as a west module. If you are integrating it into your own west workspace, add the following entry to the west.yml file here:
+
+```
+nordic/ncs/v3.4.1/nrf/west.yml
+```
+```
+    # Conexio Cloud SDK repository.
+    - name: conexio-cloud-sdk
+      url: https://github.com/Conexiotechnologies/conexio-cloud-sdk.git
+      revision: main
+      path: modules/lib/conexio-cloud-sdk
+```
+and clone all repositories including `conexio-cloud-sdk` by running:
+
+```
+west update
+```
+
+## Where the Conexio Cloud SDK Resides
+
+After successful west update, the Conexio Cloud SDK can be located at:
+```
+nordic/ncs/v3.4.1/modules/lib/conexio-cloud-sdk/
+```
+
+> You do not need to clone anything separately — the SDK is installed as a Zephyr west module.
+
+
 ## Sample Index
+
+The SDK includes multiple sample applications to get you started easily.
 
 | Sample | Feature | Complexity |
 |--------|---------|------------|
@@ -25,11 +61,10 @@ Each sample demonstrates one specific feature of the Conexio Cloud SDK.
 | [`device_schedules/`](samples/device_schedules/) | Timed commands with NVS watchdog | ⭐⭐ Intermediate |
 | [`cellular_location/`](samples/cellular_location/) | AT%NCELLMEAS cell-based positioning | ⭐⭐ Intermediate |
 | [`offline_buffer/`](samples/offline_buffer/) | Flash-backed buffering during outages | ⭐⭐ Intermediate |
-| [`fleet_provisioning/`](samples/fleet_provisioning/) | Zero-touch fleet provisioning via AWS IoT | ⭐⭐ Intermediate |
+| [`fleet_provisioning/`](samples/fleet_provisioning/) | Zero-touch fleet provisioning for Conexio Cloud | ⭐⭐ Intermediate |
 | [`fota/`](samples/fota/) | Over-the-air firmware updates | ⭐⭐⭐ Advanced |
 | [`full_app_template/`](samples/full_app_template/) | All features combined — production template | ⭐⭐⭐ Advanced |
 
----
 
 ## Recommended learning path
 
@@ -38,14 +73,8 @@ hello → sensor_data → device_commands → device_settings
       ↓
 device_schedules → cellular_location → offline_buffer → fota
       ↓
-     app  (combine everything into your own application)
+full_app_template  (combine everything into your own application)
 ```
-
----
-
-## Installing the Conexio Cloud SDK
-
-Follow the [Conexio Documentation](https://docs.conexiotech.com/) on how to install the Conexio Cloud SDK and setup the environment.
 
 ---
 *Copyright (c) 2026 Conexio Technologies, Inc. — Apache-2.0 License*
