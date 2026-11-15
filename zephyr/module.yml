@@ -1,0 +1,4 @@
+name: conexio-cloud-sdk
+build:
+  cmake: .
+  kconfig: Kconfig

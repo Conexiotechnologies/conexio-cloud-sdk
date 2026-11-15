@@ -1,0 +1,57 @@
+/*
+ * Copyright (c) 2026 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ *
+ * LED GPIO — inherited from nrf9151dk_nrf9151_common.dtsi:
+ *   led0 alias → gpio0 pin 0, GPIO_ACTIVE_HIGH
+ *   No LED overlay entry needed; the base DTS already provides the led0 alias.
+ *
+ * nPM1300-EK wiring on nRF9151DK Arduino headers:
+ *   SDA  → Arduino A4 / P0.18  (i2c2, via arduino_i2c alias)
+ *   SCL  → Arduino A5 / P0.19
+ *   INTB → Arduino D4 / P0.04  (host-int-gpios)
+ *   nPM1300 GPIO3 is configured as the INTB output (pmic-int-pin = 3)
+ */
+
+#include <samples/cellular/nrf91_bootloader_partitions.dtsi>
+#include <samples/cellular/nrf91_sram_partitions.dtsi>
+#include <zephyr/dt-bindings/regulator/npm13xx.h>
+
+/* Enable I2C pull-ups for nPM1300 PMIC communication. */
+&i2c2_default {
+	group1 {
+		bias-pull-up;
+	};
+};
+
+/* nPM1300 PMIC via nPM1300-EK on Arduino I2C (address 0x6b).
+ * Defines the pmic_charger label required by the Conexio Cloud SDK
+ * fuel gauge (DEVICE_DT_GET(DT_NODELABEL(pmic_charger))).
+ *
+ * host-int-gpios: nPM1300-EK INTB → Arduino D4 → P0.04
+ * pmic-int-pin:   nPM1300 GPIO3 is configured as INTB output
+ *
+ * NTC disabled (thermistor-ohms = <0>) — the nPM1300-EK thermistor header
+ * may not have a thermistor connected; disabling prevents the charger
+ * from halting on an open-circuit NTC reading. */
+&arduino_i2c {
+	npm1300_pmic: pmic@6b {
+		compatible = "nordic,npm1300";
+		reg = <0x6b>;
+		host-int-gpios = <&gpio0 4 0>;
+		pmic-int-pin = <3>;
+
+		pmic_charger: charger {
+			compatible = "nordic,npm1300-charger";
+			term-microvolt = <4200000>;
+			term-warm-microvolt = <4000000>;
+			current-microamp = <150000>;
+			dischg-limit-microamp = <1000000>;
+			vbus-limit-microamp = <500000>;
+			thermistor-ohms = <0>;
+			thermistor-beta = <0>;
+			charging-enable;
+		};
+	};
+};

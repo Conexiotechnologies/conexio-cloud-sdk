@@ -1,0 +1,115 @@
+/*
+ * Copyright (c) 2026 Conexio Technologies, Inc.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef FOTA_H
+#define FOTA_H
+
+#include <stdbool.h>
+
+/**
+ * @file fota.h
+ * @brief Firmware Over-the-Air update via Conexio IoT Jobs + MCUboot
+ *
+ * Subscribes to the AWS IoT Jobs MQTT topic for this device.
+ * When the Conexio Console dashboard triggers a firmware update job,
+ * this module downloads the binary via HTTPS and hands it to MCUboot
+ * for installation on next reboot.
+ *
+ * Flow:
+ *   1. Conexio Firmware Job created (from Conexio Console Firmware page)
+ *   2. Device receives job notification on $aws/things/<id>/jobs/notify
+ *   3. fota_check_and_execute() downloads the firmware binary
+ *   4. MCUboot validates the image and marks it for swap
+ *   5. Device reboots into new firmware
+ *   6. If new firmware calls fota_confirm() within boot_timeout, install
+ *      is confirmed. Otherwise MCUboot reverts to previous version.
+ */
+
+/** FOTA event types delivered to the application callback. */
+enum fota_event_type {
+    FOTA_EVT_STARTED,       /**< Download started */
+    FOTA_EVT_PROGRESS,      /**< Download in progress — check data.progress_pct */
+    FOTA_EVT_COMPLETE,      /**< Download complete — device will reboot */
+    FOTA_EVT_FAILED,        /**< Download or validation failed */
+    FOTA_EVT_CONFIRMED,     /**< New firmware confirmed (post-reboot) */
+};
+
+struct fota_event {
+    enum fota_event_type type;
+    union {
+        int  progress_pct;  /**< 0-100 (FOTA_EVT_PROGRESS) */
+        int  error;         /**< errno value (FOTA_EVT_FAILED) */
+    } data;
+};
+
+typedef void (*fota_event_cb_t)(const struct fota_event *evt);
+
+/**
+ * @brief Initialise FOTA module.
+ * Subscribes to the IoT Jobs topic for this device.
+ * @param device_id  The device's Thing name (IMEI-derived).
+ * @param cb         Application callback for FOTA events.
+ * @return 0 on success.
+ */
+int fota_init(const char *device_id, fota_event_cb_t cb);
+
+/**
+ * @brief Check for pending IoT Jobs and execute if found.
+ * Non-blocking — call periodically or from CONNACK handler.
+ * Returns immediately if no job is pending.
+ * @return 0 if no job or job successful, negative errno on error.
+ */
+int fota_check_and_execute(void);
+
+/**
+ * @brief Confirm new firmware is working (call once after successful boot).
+ * Must be called within MCUboot's confirmation timeout window.
+ * If not called, MCUboot reverts to previous firmware on next reboot.
+ */
+void fota_confirm(void);
+
+/**
+ * @brief Returns true if a FOTA update is currently in progress.
+ */
+bool fota_is_active(void);
+
+/**
+ * @brief Register a callback that gates whether a FOTA download may start.
+ *
+ * When set, the SDK calls this function before starting any firmware download.
+ * Return false to defer the update — the SDK will retry every
+ * CONFIG_FOTA_PAUSE_RETRY_SEC seconds until the callback returns true.
+ *
+ * Use this to implement a maintenance window: defer updates while a motor
+ * is running, a sensor measurement is in progress, or the device is in a
+ * safety-critical state.
+ *
+ * Example:
+ * @code
+ * static bool safe_to_update(void) {
+ *     return !motor_is_running() && !measurement_in_progress();
+ * }
+ * fota_set_can_start_cb(safe_to_update);
+ * @endcode
+ *
+ * Pass NULL to remove a previously registered callback (always allow).
+ *
+ * @param cb  Callback returning true when it is safe to start the download,
+ *            or NULL to always allow immediately.
+ */
+typedef bool (*fota_can_start_cb_t)(void);
+void fota_set_can_start_cb(fota_can_start_cb_t cb);
+
+/**
+ * @brief Handle a FIRMWARE_UPDATE command from the cloud command queue.
+ * Parses the job ID and document and starts the FOTA download.
+ * @param job_id       The IoT Job ID string.
+ * @param job_document The job document JSON string.
+ * @return 0 on success, negative errno on error.
+ */
+int fota_handle_command(const char *job_id, const char *job_document);
+
+#endif /* FOTA_H */

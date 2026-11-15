@@ -1,0 +1,242 @@
+/*
+ * Copyright (c) 2026 Conexio Technologies, Inc.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * power_mgr.c — LTE PSM / eDRX power management
+ *
+ * Negotiates Power Saving Mode (PSM) or extended Discontinuous Reception
+ * (eDRX) with the LTE network to minimise current consumption between
+ * telemetry transmissions on battery-powered devices.
+ *
+ * PSM summary:
+ *   - Modem negotiates a sleep window with the network
+ *   - Consumes ~2-3 µA during sleep (vs ~6-10 mA in idle connected)
+ *   - Wakes automatically at TAU timer expiry, or on power_mgr_wake()
+ *   - ~5-20x battery life improvement vs always-on depending on interval
+ *
+ * Typical configuration for 60s telemetry interval:
+ *   PSM_TAU_SEC       = 3600  (network keepalive every hour)
+ *   PSM_ACTIVE_SEC    = 10    (10s window to connect + publish + sleep)
+ */
+
+#include <zephyr/kernel.h>
+#include <modem/lte_lc.h>
+#include <modem/modem_info.h>
+#include <zephyr/logging/log.h>
+#include <stdio.h>
+#include "power_mgr.h"
+
+/* Forward declarations for fuel gauge sleep notifications.
+ * Only compiled when the fuel gauge module is active.
+ * Defined in fuel_gauge.c — called directly from the LTE event handler
+ * so the fuel gauge library is informed of sleep state changes
+ * on the same thread that receives the modem event (avoids race). */
+#if defined(CONFIG_CONEXIO_CLOUD_BATTERY_METRICS) && defined(CONFIG_NRF_FUEL_GAUGE)
+#include "fuel_gauge.h"
+#endif
+
+LOG_MODULE_REGISTER(power_mgr, LOG_LEVEL_INF);
+
+static bool g_psm_active = false;
+static volatile bool g_psm_sleeping = false;   /* true only while modem is actually in PSM sleep */
+static bool g_psm_decision_received = false; /* true once network grants or denies PSM */
+static K_SEM_DEFINE(modem_ready_sem, 0, 1);
+static K_SEM_DEFINE(psm_grant_sem, 0, 1);    /* given when network sends PSM_UPDATE */
+
+/* ── LTE event handler ────────────────────────────────────────────────────── */
+
+static void lte_evt_handler(const struct lte_lc_evt *const evt)
+{
+    switch (evt->type) {
+
+    case LTE_LC_EVT_NW_REG_STATUS:
+        if (evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_HOME ||
+            evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_ROAMING) {
+            LOG_INF("LTE re-registered after PSM sleep (%s)",
+                    evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_HOME
+                    ? "home" : "roaming");
+            k_sem_give(&modem_ready_sem);
+        } else if (evt->nw_reg_status == LTE_LC_NW_REG_NOT_REGISTERED) {
+            LOG_WRN("LTE not registered");
+        }
+        break;
+
+#if defined(CONFIG_LTE_LC_PSM_MODULE)
+    case LTE_LC_EVT_PSM_UPDATE:
+        if (evt->psm_cfg.active_time == -1) {
+            LOG_WRN("Network did not grant PSM (TAU=%d, active=-1) — "
+                    "device will stay connected between transmissions",
+                    evt->psm_cfg.tau);
+            g_psm_active = false;
+        } else {
+            LOG_INF("PSM granted: TAU=%ds, active=%ds",
+                    evt->psm_cfg.tau, evt->psm_cfg.active_time);
+            g_psm_active = true;
+        }
+        /* Signal that the network has made its PSM decision (grant or deny).
+         * power_mgr_wait_psm_decision() unblocks on this. */
+        if (!g_psm_decision_received) {
+            g_psm_decision_received = true;
+            k_sem_give(&psm_grant_sem);
+        }
+        break;
+#endif /* CONFIG_LTE_LC_PSM_MODULE */
+
+#if defined(CONFIG_LTE_LC_EDRX_MODULE)
+    case LTE_LC_EVT_EDRX_UPDATE:
+        LOG_INF("eDRX updated: mode=%d, edrx=%dms, ptw=%dms",
+                evt->edrx_cfg.mode,
+                (int)(evt->edrx_cfg.edrx * 1000),
+                (int)(evt->edrx_cfg.ptw  * 1000));
+        break;
+#endif /* CONFIG_LTE_LC_EDRX_MODULE */
+
+#if defined(CONFIG_LTE_LC_MODEM_SLEEP_MODULE)
+    case LTE_LC_EVT_MODEM_SLEEP_ENTER:
+        LOG_DBG("Modem entered PSM sleep");
+        g_psm_sleeping = true;
+#if defined(CONFIG_CONEXIO_CLOUD_BATTERY_METRICS) && defined(CONFIG_NRF_FUEL_GAUGE)
+        conexio_fuel_gauge_on_sleep_enter();
+#endif
+        break;
+
+    case LTE_LC_EVT_MODEM_SLEEP_EXIT:
+        LOG_DBG("Modem exited PSM sleep — giving ready semaphore");
+        g_psm_sleeping = false;
+        k_sem_give(&modem_ready_sem);
+#if defined(CONFIG_CONEXIO_CLOUD_BATTERY_METRICS) && defined(CONFIG_NRF_FUEL_GAUGE)
+        conexio_fuel_gauge_on_sleep_exit();
+#endif
+        break;
+#endif /* CONFIG_LTE_LC_MODEM_SLEEP_MODULE */
+
+    default:
+        break;
+    }
+}
+
+/* ── Public API ───────────────────────────────────────────────────────────── */
+
+int power_mgr_init(const struct power_mgr_config *cfg)
+{
+    if (!cfg) return -EINVAL;
+
+    /* Register for LTE events so we get PSM confirmations */
+    lte_lc_register_handler(lte_evt_handler);
+
+    if (cfg->psm_enable && !cfg->edrx_enable) {
+        /*
+         * PSM parameters were already set and requested before LTE attach
+         * in conexio_cloud_init() (Step 6 pre-attach block) so the modem
+         * included them in the Attach Request and negotiated immediately.
+         *
+         * We only register the event handler here to receive the
+         * LTE_LC_EVT_PSM_UPDATE confirmation with the granted values.
+         * Calling lte_lc_psm_req() again here would be redundant and
+         * could trigger an unnecessary TAU.
+         */
+        LOG_INF("PSM requested: TAU=%ds, active=%ds",
+                cfg->psm_tau_sec, cfg->psm_active_time_sec);
+
+    } else if (cfg->edrx_enable && !cfg->psm_enable) {
+        /* NCS v3.2.1: lte_lc_edrx_req() takes bool (true=enable, false=disable) */
+        int ret = lte_lc_edrx_req(true);
+        if (ret) {
+            LOG_WRN("lte_lc_edrx_req failed (%d)", ret);
+        } else {
+            LOG_INF("eDRX requested");
+        }
+    } else if (!cfg->psm_enable && !cfg->edrx_enable) {
+        /* Disable PSM explicitly to ensure consistent state */
+        lte_lc_psm_req(false);
+        LOG_INF("PSM/eDRX disabled — modem stays connected between transmissions");
+    }
+
+    return 0;
+}
+
+int power_mgr_wait_psm_decision(int timeout_sec)
+{
+    if (g_psm_decision_received) {
+        /* Already received before caller got here — no wait needed */
+        return 0;
+    }
+
+    /* Block until LTE_LC_EVT_PSM_UPDATE fires or timeout expires.
+     * The network typically sends this within 100-500 ms of registration.
+     * If it never comes (e.g. PSM not enabled, or prj.conf has PSM off),
+     * this times out gracefully and we proceed — no data is lost. */
+    int ret = k_sem_take(&psm_grant_sem, K_SECONDS(timeout_sec));
+    if (ret == -EAGAIN) {
+        LOG_WRN("PSM decision not received within %ds — proceeding without it",
+                timeout_sec);
+    }
+    return 0;   /* always succeed — timeout is not fatal */
+}
+
+int power_mgr_wake(int timeout_sec)
+{
+    if (!g_psm_active) {
+        /* PSM not active — modem stays connected, nothing to wait for */
+        return 0;
+    }
+
+    if (!g_psm_sleeping) {
+        /* PSM is configured but modem is currently awake and registered —
+         * no need to wait. This is the normal state between transmissions
+         * before the T3324 active timer has expired. */
+        return 0;
+    }
+
+    /* Modem is actually in PSM sleep — wait for MODEM_SLEEP_EXIT event */
+    LOG_DBG("Waiting for modem to wake from PSM (timeout %ds)...", timeout_sec);
+    int ret = k_sem_take(&modem_ready_sem, K_SECONDS(timeout_sec));
+    if (ret == -EAGAIN) {
+        LOG_WRN("Modem wake timeout after %ds — continuing anyway", timeout_sec);
+        return -ETIMEDOUT;
+    }
+
+    LOG_DBG("Modem awake and registered");
+    return 0;
+}
+
+void power_mgr_sleep(void)
+{
+    if (!g_psm_active) return;
+    /*
+     * PSM entry is automatic after the T3324 active timer expires.
+     * The MQTT disconnect before sleep is handled in conexio_cloud.c
+     * (sdk_internal_event_handler EVT_PUBLISHED case) which has access
+     * to both power_mgr and transport contexts.
+     */
+    LOG_DBG("Transmission complete — MQTT will be disconnected, modem entering PSM");
+}
+
+bool power_mgr_is_psm_active(void)
+{
+    /* Return true only when the modem is actually in PSM sleep,
+     * not just when PSM has been granted by the network. This prevents
+     * the cloud thread from waiting on a wake event when the modem is
+     * already awake and registered. */
+    return g_psm_sleeping;
+}
+
+int power_mgr_get_rssi(void)
+{
+    struct modem_param_info mp;
+    if (modem_info_params_get(&mp) != 0) return -999;
+    return (int)mp.network.rsrp.value;
+}
+
+int power_mgr_get_modem_temp(void)
+{
+    /* modem_info_get_temperature() issues AT%XTEMP — ~5 ms blocking.
+     * Returns the modem die temperature in degrees Celsius.
+     * Useful for detecting overheating in enclosures (>85°C = modem shutdown). */
+    int temp_val;
+    if (modem_info_get_temperature(&temp_val) != 0) return -999;
+    return temp_val;
+}
